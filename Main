@@ -1,0 +1,359 @@
+/*
+ * ProyectoFinal_GuitarHero.c
+ *
+ * Created: 03/01/2026 04:49:03 p. m.
+ * Author : diego
+ */ 
+
+/*
+ * Proyecto_GuitarHero_AVR.c
+ * F_CPU: 16MHz
+ * Microcontrolador: ATmega328p
+ */ 
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <avr/pgmspace.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+// ==========================================
+// CONFIGURACIÓN DE PINES
+// ==========================================
+// Buzzer en PD5
+#define BUZZER_PIN PD5
+#define BUZZER_PORT PORTD
+#define BUZZER_DDR DDRD
+
+// Guitarra en PD0-PD4
+// PD0-PD3: Notas, PD4: Strum
+#define GUITAR_PIN PIND
+#define BTN_VERDE  PD0
+#define BTN_ROJO   PD1
+#define BTN_AMAR   PD2
+#define BTN_AZUL   PD3
+#define BTN_STRUM  PD4
+
+// ==========================================
+// MÚSICA Y FRECUENCIAS
+// ==========================================
+// Frecuencias aproximadas para Timer
+#define NOTE_C4  261
+#define NOTE_D4  294
+#define NOTE_E4  329
+#define NOTE_F4  349
+#define NOTE_G4  392
+#define NOTE_A4  440
+#define NOTE_B4  493
+#define NOTE_C5  523
+
+volatile uint16_t timer_overflows = 0;
+volatile uint16_t target_overflows = 0;
+volatile bool sound_enabled = false;
+
+// Inicializar Timer0 para sonido en PD5 (Manual toggling en ISR para flexibilidad)
+void Audio_Init(void) {
+    BUZZER_DDR |= (1 << BUZZER_PIN);
+    // Timer 0 Modo Normal, Prescaler 64
+    // 16MHz / 64 = 250kHz ticks. 
+    TCCR0A = 0;
+    TCCR0B = (1 << CS01) | (1 << CS00); 
+    TIMSK0 |= (1 << TOIE0); // Habilitar interrupción overflow
+    sei();
+}
+
+void Play_Tone(uint16_t freq) {
+    if (freq == 0) {
+        sound_enabled = false;
+        return;
+    }
+    // Calcular overflows necesarios para la mitad del periodo
+    // F_timer = 250,000 Hz. 
+    // Ticks por ciclo = 250000 / freq.
+    // Ticks por toggle = 125000 / freq.
+    // Como es timer de 8 bits (256), usamos overflows aproximados o recarga.
+    // Para simplificar en apuros: Usamos un contador simple en la ISR.
+    
+    target_overflows = (125000 / freq) / 256; 
+    if (target_overflows == 0) target_overflows = 1;
+    sound_enabled = true;
+}
+
+void Stop_Tone(void) {
+    sound_enabled = false;
+    BUZZER_PORT &= ~(1 << BUZZER_PIN);
+}
+
+ISR(TIMER0_OVF_vect) {
+    if (sound_enabled) {
+        timer_overflows++;
+        if (timer_overflows >= target_overflows) {
+            BUZZER_PORT ^= (1 << BUZZER_PIN); // Toggle PD5
+            timer_overflows = 0;
+        }
+    }
+}
+
+// ==========================================
+// DRIVER I2C y SH1107 (Simplificado)
+// ==========================================
+void I2C_Start(void){ TWCR=(1<<TWINT)|(1<<TWSTA)|(1<<TWEN); while(!(TWCR&(1<<TWINT))); }
+void I2C_Stop(void){ TWCR=(1<<TWINT)|(1<<TWEN)|(1<<TWSTO); }
+void I2C_Write(uint8_t d){ TWDR=d; TWCR=(1<<TWINT)|(1<<TWEN); while(!(TWCR&(1<<TWINT))); }
+
+void SH1107_Cmd(uint8_t c) {
+    I2C_Start(); I2C_Write(0x78); I2C_Write(0x00); I2C_Write(c); I2C_Stop();
+}
+void SH1107_Dat(uint8_t d) {
+    I2C_Start(); I2C_Write(0x78); I2C_Write(0x40); I2C_Write(d); I2C_Stop();
+}
+
+void SH1107_Init(void) {
+    _delay_ms(50);
+    SH1107_Cmd(0xAE); SH1107_Cmd(0x20); SH1107_Cmd(0x00); // Modo direccionamiento
+    SH1107_Cmd(0xB0); SH1107_Cmd(0xC8); SH1107_Cmd(0x00);
+    SH1107_Cmd(0x10); SH1107_Cmd(0x40); SH1107_Cmd(0x81);
+    SH1107_Cmd(0x80); // Contraste medio
+    SH1107_Cmd(0xA1); SH1107_Cmd(0xA6); SH1107_Cmd(0xA8);
+    SH1107_Cmd(0x7F); SH1107_Cmd(0xD3); SH1107_Cmd(0x00);
+    SH1107_Cmd(0xD5); SH1107_Cmd(0x80); SH1107_Cmd(0xD9);
+    SH1107_Cmd(0x22); SH1107_Cmd(0xDA); SH1107_Cmd(0x12);
+    SH1107_Cmd(0xDB); SH1107_Cmd(0x40); SH1107_Cmd(0xAF); // Display ON
+    _delay_ms(10);
+}
+
+void SH1107_Clear(void) {
+    for(uint8_t p=0; p<16; p++) {
+        SH1107_Cmd(0xB0 + p); SH1107_Cmd(0x00); SH1107_Cmd(0x10);
+        for(uint8_t c=0; c<128; c++) SH1107_Dat(0x00);
+    }
+}
+
+// Función primitiva para dibujar un bloque (nota)
+// x: columna (0-127), page: página vertical (0-15), pattern: byte a dibujar
+void Draw_Block(uint8_t x, uint8_t page, uint8_t width, uint8_t pattern) {
+    SH1107_Cmd(0xB0 + page);
+    SH1107_Cmd(0x00 + (x & 0x0F));
+    SH1107_Cmd(0x10 + ((x >> 4) & 0x0F));
+    for(uint8_t i=0; i<width; i++) SH1107_Dat(pattern);
+}
+
+// Fuente básica para texto
+const uint8_t font[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x00, // Space
+    0x7F, 0x09, 0x09, 0x09, 0x06, // P
+    0x7F, 0x40, 0x40, 0x40, 0x40, // L
+    0x7E, 0x11, 0x11, 0x11, 0x7E, // A
+    0x03, 0x04, 0x78, 0x04, 0x03, // Y
+    0x3E, 0x41, 0x41, 0x41, 0x22, // C
+    0x3E, 0x51, 0x49, 0x45, 0x3E, // 0
+    0x00, 0x42, 0x7F, 0x40, 0x00, // 1
+    0x42, 0x61, 0x51, 0x49, 0x46, // 2
+    0x3E, 0x41, 0x49, 0x49, 0x3A  // G (Game Over aprox)
+};
+
+void Print_String(uint8_t x, uint8_t page, char* str) {
+    // Implementación muy simple solo para el ejemplo
+    // Nota: Necesitarías la fuente completa para texto complejo
+    // Aquí solo usaré "PLAY" como placeholder visual en el menú
+    // Si necesitas texto completo, usa tu función original SH1107_WriteString
+}
+
+// Usa tu función original de texto, la he resumido arriba para ahorrar espacio visual
+// pero INTEGRALA AQUÍ (copia tu SH1107_WriteString y font_5x7 del prompt)
+// ... [Tu código de fuente y WriteString aquí] ...
+// Por brevedad, asumo que las tienes.
+
+// ==========================================
+// TECLADO MATRICIAL
+// ==========================================
+char Read_Keypad(void) {
+    PORTB = 0xF0; // PB0-3 (filas) Z/Input, PB4-7 (cols) Pullup
+    DDRB  = 0x0F; // PB0-3 Salida 0, PB4-7 Entrada
+    
+    // Barrido muy simple
+    for (uint8_t r = 0; r < 4; r++) {
+        PORTB = ~(1 << r); // Poner fila r en LOW
+        _delay_us(10);
+        uint8_t cols = PINB & 0xF0;
+        if (cols != 0xF0) {
+            _delay_ms(20); // Debounce
+            if ((PINB & 0xF0) != 0xF0) {
+                if (!(cols & 0x10)) return (r*4 + 0) + '0';
+                if (!(cols & 0x20)) return (r*4 + 1) + '0';
+                if (!(cols & 0x40)) return (r*4 + 2) + '0';
+                if (!(cols & 0x80)) return (r*4 + 3) + '0';
+            }
+        }
+        PORTB = 0xF0; // Reset
+    }
+    return 0; // Nada presionado
+}
+
+// ==========================================
+// MOTOR DEL JUEGO
+// ==========================================
+
+// Estructura de una nota
+typedef struct {
+    uint16_t time_delay; // Tiempo de espera antes de que aparezca
+    uint8_t lane;        // 0: Verde, 1: Roja, 2: Amarilla, 3: Azul
+    uint16_t freq;       // Frecuencia a sonar si se acierta
+} Note;
+
+// CANCIÓN DE EJEMPLO (Guardada en Flash para ahorrar RAM)
+const Note cancion1[] PROGMEM = {
+    {10, 0, NOTE_C4}, {10, 1, NOTE_D4}, {10, 2, NOTE_E4}, {10, 3, NOTE_F4},
+    {10, 0, NOTE_G4}, {5,  1, NOTE_A4}, {5,  0, NOTE_B4}, {20, 3, NOTE_C5},
+    {0,0,0} // Fin
+};
+
+// Variables de juego
+uint8_t score = 0;
+// Posición vertical de las notas activas (0 = arriba, 120 = zona de hit)
+// Usamos -1 para nota inactiva
+int8_t active_notes_y[5] = {-1, -1, -1, -1, -1}; 
+uint8_t active_notes_lane[5];
+uint16_t active_notes_freq[5];
+
+void Game_Loop(void) {
+    SH1107_Clear();
+    score = 0;
+    
+    // Dibujar interfaz base
+    // Carriles en X: 20, 50, 80, 110
+    // Zona de hit en Y: Page 14-15
+    
+    uint8_t song_idx = 0;
+    uint8_t ticks = 0;
+    
+    while(1) {
+        // 1. Lógica de Spawn de notas
+        // Leemos la siguiente nota de la flash
+        uint16_t delay = pgm_read_word(&cancion1[song_idx].time_delay);
+        
+        if (delay > 0) {
+            if (ticks >= delay) {
+                // Intentar spawnear nota
+                for(int i=0; i<5; i++) {
+                    if(active_notes_y[i] == -1) {
+                        active_notes_y[i] = 0; // Empieza arriba
+                        active_notes_lane[i] = pgm_read_byte(&cancion1[song_idx].lane);
+                        active_notes_freq[i] = pgm_read_word(&cancion1[song_idx].freq);
+                        song_idx++;
+                        ticks = 0;
+                        break;
+                    }
+                }
+            } else {
+                ticks++;
+            }
+        } else {
+            // Fin de canción o bucle
+             if (active_notes_y[0] == -1 && active_notes_y[1] == -1 && active_notes_y[2] == -1 && active_notes_y[3] == -1) {
+                 break; // Salir si no hay notas y acabó canción
+             }
+        }
+        
+        // 2. Mover notas y Dibujar
+        for(int i=0; i<5; i++) {
+            if(active_notes_y[i] != -1) {
+                // Borrar posición anterior (dibujando negro)
+                uint8_t x_pos = 20 + (active_notes_lane[i] * 30);
+                Draw_Block(x_pos, active_notes_y[i]/8, 16, 0x00); 
+                
+                // Mover
+                active_notes_y[i] += 2; // Velocidad de caída
+                
+                // Dibujar nueva posición (dibujando solido)
+                // Convertir Y pixels a paginas aprox
+                if(active_notes_y[i] < 128)
+                    Draw_Block(x_pos, active_notes_y[i]/8, 16, 0xFF);
+                
+                // 3. Checar si salió de pantalla (Miss)
+                if(active_notes_y[i] > 120) {
+                    active_notes_y[i] = -1; // Desaparece
+                    // Aquí podrías restar puntos
+                }
+            }
+        }
+        
+        // 4. Dibujar Zona de Hit (Línea estática abajo)
+        Draw_Block(20, 14, 16, 0x81); // Carril 1
+        Draw_Block(50, 14, 16, 0x81); // Carril 2
+        Draw_Block(80, 14, 16, 0x81); // Carril 3
+        Draw_Block(110, 14, 16, 0x81); // Carril 4
+        
+        // 5. LEER GUITARRA Y VALIDAR
+        // Lógica: Debe presionarse STRUM (PD4) + NOTA (PDx) AL MISMO TIEMPO
+        // y debe haber una nota en la zona Y > 100 y Y < 120
+        
+        uint8_t p = PIND; // Leer todo el puerto D
+        bool strum_pressed = !(p & (1 << BTN_STRUM));
+        
+        if (strum_pressed) {
+            for(int i=0; i<5; i++) {
+                if (active_notes_y[i] > 100 && active_notes_y[i] < 125) {
+                    // La nota está en zona de hit. Verificamos el botón correcto
+                    bool hit = false;
+                    switch(active_notes_lane[i]) {
+                        case 0: if(!(p & (1<<BTN_VERDE))) hit = true; break;
+                        case 1: if(!(p & (1<<BTN_ROJO))) hit = true; break;
+                        case 2: if(!(p & (1<<BTN_AMAR))) hit = true; break;
+                        case 3: if(!(p & (1<<BTN_AZUL))) hit = true; break;
+                    }
+                    
+                    if(hit) {
+                        Play_Tone(active_notes_freq[i]);
+                        active_notes_y[i] = -1; // Nota consumida
+                        score++;
+                        // Pequeño flash visual o delay
+                        _delay_ms(20); 
+                        Stop_Tone();
+                    }
+                }
+            }
+        }
+        
+        _delay_ms(50); // Controla la velocidad del juego (FPS)
+    }
+    
+    // Mostrar Score al final
+    SH1107_Clear();
+    // Usa tu función de Texto aquí para imprimir "SCORE: " + score
+    // SH1107_WriteString(10, 3, "FIN DEL JUEGO");
+    _delay_ms(2000);
+}
+
+int main(void) {
+    // 1. Configurar Pines
+    // Guitarra Inputs Pull-ups
+    DDRD &= ~((1<<BTN_VERDE)|(1<<BTN_ROJO)|(1<<BTN_AMAR)|(1<<BTN_AZUL)|(1<<BTN_STRUM));
+    PORTD |= (1<<BTN_VERDE)|(1<<BTN_ROJO)|(1<<BTN_AMAR)|(1<<BTN_AZUL)|(1<<BTN_STRUM);
+    
+    // I2C Clock setup
+    CLKPR = 0x80; CLKPR = 0x00;
+    TWBR = 12; // 400kHz I2C
+    
+    // Inicializar módulos
+    Audio_Init();
+    SH1107_Init();
+    SH1107_Clear();
+    
+    // Loop Principal (Menú)
+    while (1) {
+        // Tu función de texto
+        // SH1107_WriteString(10, 2, "1. JUGAR CANCION");
+        
+        char k = Read_Keypad();
+        if (k == '1') {
+             Game_Loop();
+             SH1107_Clear();
+        }
+    }
+}
+
